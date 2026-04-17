@@ -4,29 +4,36 @@
  * Wires together:
  *   transport   → WebSocket accept / dispatch
  *   session     → anonymous identity creation + tracking
- *   matchmaking → quick-match queue + private rooms
+ *   matchmaking → quick-match queue + private rooms + tick loop
  *   engine      → authoritative match loop (T03)
  *   serialization → message contract (T04)
  *
- * Per T01, this bootstrap wires the module boundaries and provides
- * a working local development server. T02 implements session lifecycle,
- * quick-match queueing, and private room creation/join.
+ * T01: module boundaries + bootstrap
+ * T02: session lifecycle, quick-match queue, private rooms
+ * T03: authoritative tick engine, input handling, match_start/broadcast/round_end
  */
 
 import { WsTransport } from "./transport/ws";
 import { SessionManager } from "./session/manager";
 import { MatchQueue } from "./matchmaking/queue";
 import { RoomRegistry } from "./matchmaking/rooms";
+import { serialize } from "./serialization/protocol";
 import {
   ClientEventType,
   type ErrorPayload,
   type HelloPayload,
   type MatchFoundPayload,
+  type MatchStartPayload,
+  type StatePayload,
+  type RoundEndPayload,
   type ServerMessage,
   type ClientMessage,
+  type InputPayload,
 } from "./serialization/protocol";
+import type { MatchResult, StateSnapshot } from "./engine/shared";
 import type { WebSocket } from "ws";
 import { Session } from "./session/manager";
+import type { Direction } from "../game/constants";
 
 // ---------------------------------------------------------------------------
 // Module wiring
@@ -55,19 +62,60 @@ function sendError(ws: WebSocket, message: string, code = "UNKNOWN"): void {
   send(ws, payload);
 }
 
-function broadcastMatchFound(
+// ---------------------------------------------------------------------------
+// Room → client event mapping
+// ---------------------------------------------------------------------------
+
+/**
+ * Called whenever a room tick produces a result or snapshot.
+ * Broadcasts to both players in the room.
+ */
+function onRoomTick(
   matchId: string,
-  displayName: string,
-  p1Ws: WebSocket,
-  p2Ws: WebSocket,
+  result: MatchResult,
+  snapshot: StateSnapshot,
 ): void {
-  const msg: MatchFoundPayload = {
-    type: "match_found",
-    match_id: matchId,
-    displayName,
+  const room = roomRegistry.get(matchId);
+  if (!room) return;
+
+  const stateMsg: StatePayload = {
+    type: "state",
+    match_id: snapshot.match_id,
+    tick: snapshot.tick,
+    status: snapshot.status,
+    food: snapshot.food,
+    players: snapshot.players,
+    result: snapshot.result,
   };
-  send(p1Ws, msg);
-  send(p2Ws, msg);
+
+  // Broadcast to both players
+  const broadcastRoom = (session: Session) => send(session.ws, stateMsg);
+  room.player_1 && broadcastRoom(room.player_1);
+  room.player_2 && broadcastRoom(room.player_2);
+}
+
+function sendMatchStart(p1: Session, p2: Session, matchId: string): void {
+  const msg: MatchStartPayload = { type: "match_start", match_id: matchId, player_id: p1.player_id, slot: 1 };
+  send(p1.ws, msg);
+  const msg2: MatchStartPayload = { type: "match_start", match_id: matchId, player_id: p2.player_id, slot: 2 };
+  send(p2.ws, msg2);
+}
+
+function sendRoundEnd(room: Session[], matchId: string, result: { winner_player_id: string | null; is_draw: boolean }): void {
+  const msg: RoundEndPayload = { type: "round_end", match_id: matchId, result };
+  for (const s of room) {
+    send(s.ws, msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Room lifecycle helpers
+// ---------------------------------------------------------------------------
+
+function startRoomMatch(room: import("./matchmaking/rooms").Room, p1: Session, p2: Session): void {
+  sendMatchStart(p1, p2, room.match_id);
+  room.onFinished = onRoomTick;
+  room.startMatch();
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +136,7 @@ function handleQueueJoin(session: Session): void {
     return;
   }
 
-  // Paired — create a private room and assign both players
+  // Paired — create a room
   const room = roomRegistry.create();
   const slot1 = room.join(session);
   const slot2 = room.join(partner);
@@ -101,18 +149,11 @@ function handleQueueJoin(session: Session): void {
   const displayName1 = session.displayName ?? "Player 1";
   const displayName2 = partner.displayName ?? "Player 2";
 
-  // Send each player info about their match + opponent
-  send(session.ws, {
-    type: "match_found",
-    match_id: room.match_id,
-    displayName: displayName2,
-  } as ServerMessage);
+  send(session.ws, { type: "match_found", match_id: room.match_id, displayName: displayName2 } as ServerMessage);
+  send(partner.ws, { type: "match_found", match_id: room.match_id, displayName: displayName1 } as ServerMessage);
 
-  send(partner.ws, {
-    type: "match_found",
-    match_id: room.match_id,
-    displayName: displayName1,
-  } as ServerMessage);
+  // Auto-start the match
+  startRoomMatch(room, session, partner);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,14 +180,9 @@ function handlePrivateMatchJoin(
   session: Session,
   code: string,
 ): void {
-  const room = roomRegistry.get(code);
+  const room = roomRegistry.getCode(code);
   if (!room) {
     sendError(session.ws, `Room not found: ${code}`, "ROOM_NOT_FOUND");
-    return;
-  }
-
-  if (room.status !== "waiting") {
-    sendError(session.ws, "Room is no longer accepting players", "ROOM_FULL");
     return;
   }
 
@@ -162,17 +198,44 @@ function handlePrivateMatchJoin(
   const opponent = room.getOtherPlayer(session);
   const displayName = opponent.displayName ?? "Player 1";
 
-  send(session.ws, {
-    type: "match_found",
-    match_id: room.match_id,
-    displayName,
-  } as ServerMessage);
+  send(session.ws, { type: "match_found", match_id: room.match_id, displayName } as ServerMessage);
+  send(opponent.ws, { type: "match_found", match_id: room.match_id, displayName: session.displayName ?? "Player 2" } as ServerMessage);
 
-  send(opponent.ws, {
-    type: "match_found",
-    match_id: room.match_id,
-    displayName: session.displayName ?? "Player 2",
-  } as ServerMessage);
+  // Both players present — start the match
+  startRoomMatch(room, session, opponent);
+}
+
+// ---------------------------------------------------------------------------
+// Input handling
+// ---------------------------------------------------------------------------
+
+function handleInput(session: Session, msg: InputPayload): void {
+  // Validate: message must match session's player_id and match_id
+  if (msg.player_id !== session.player_id) {
+    sendError(session.ws, "player_id mismatch", "PLAYER_ID_MISMATCH");
+    return;
+  }
+
+  if (msg.match_id !== session.match_id) {
+    sendError(session.ws, "match_id mismatch", "MATCH_ID_MISMATCH");
+    return;
+  }
+
+  if (!session.match_id) {
+    sendError(session.ws, "Not in a match", "NOT_IN_MATCH");
+    return;
+  }
+
+  const room = roomRegistry.get(session.match_id);
+  if (!room) {
+    sendError(session.ws, "Room not found", "ROOM_NOT_FOUND");
+    return;
+  }
+
+  const accepted = room.submitInput(msg.player_id, msg.direction);
+  if (!accepted) {
+    sendError(session.ws, "Input rejected (invalid direction or already queued)", "INPUT_REJECTED");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,20 +243,19 @@ function handlePrivateMatchJoin(
 // ---------------------------------------------------------------------------
 
 function handleDisconnect(playerId: string): void {
-  // Don't remove "(unassigned)" — no session to clean up
   if (playerId === "(unassigned)") return;
 
   const session = sessions.get(playerId);
   if (!session) return;
 
-  // If in a room, notify the other player and remove the room
+  // If in a running match, opponent wins by forfeit
   if (session.match_id) {
     const room = roomRegistry.get(session.match_id);
-    if (room && room.hasBothPlayers()) {
+    if (room && room.status === "running") {
       const other = room.getOtherPlayer(session);
       send(other.ws, {
         type: "error",
-        message: `Opponent ${playerId} disconnected`,
+        message: `Opponent ${playerId} disconnected — you win!`,
         code: "OPPONENT_DISCONNECT",
       } as ServerMessage);
     }
@@ -243,6 +305,10 @@ function handleMessage(
       handlePrivateMatchJoin(session, msg.code);
       break;
 
+    case ClientEventType.INPUT:
+      handleInput(session, msg as InputPayload);
+      break;
+
     default:
       sendError(ws, `Unknown message type: ${(msg as { type: string }).type}`, "UNKNOWN_TYPE");
       break;
@@ -259,6 +325,10 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     console.log("Shutting down...");
+    for (const room of roomRegistry.all) {
+      room.shutdown();
+    }
+    roomRegistry.all.forEach((r) => roomRegistry.remove(r.match_id));
     await transport.stop();
     process.exit(0);
   };
