@@ -1,7 +1,7 @@
 /**
  * Session manager — creates anonymous identities and tracks connected
  * players. Each session owns a WebSocket connection, a generated
- * player_id, and an optional match_id.
+ * player_id, and an optional match_id + slot.
  */
 
 import type { WebSocket } from "ws";
@@ -41,6 +41,11 @@ export class SessionManager {
     this.byWs.set(getWsId(ws), session);
     this.byId.set(session.player_id, session);
     return session;
+  }
+
+  /** Look up a session by its WebSocket. */
+  getByWs(ws: WebSocket): Session | undefined {
+    return this.byWs.get(getWsId(ws));
   }
 
   remove(playerId: string): Session | null {

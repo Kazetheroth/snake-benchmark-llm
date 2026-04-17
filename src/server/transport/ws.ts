@@ -10,27 +10,50 @@ import { serialize } from "../serialization/protocol";
 import type { ServerMessage } from "../serialization/protocol";
 import { WS_HOST, WS_PORT, MAX_CONNECTIONS_PER_IP } from "../config";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type RawMessage = any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Request = any;
+type Request = import("http").IncomingMessage & { socket?: { remoteAddress?: string } };
 
 export type MessageHandler = (
   ws: WebSocket,
-  session: { player_id: string },
+  context: {
+    player_id: string;
+    match_id?: string;
+    player_slot?: number;
+  },
   raw: string,
 ) => void;
+
+export type DisconnectHandler = (playerId: string) => void;
+
+let wsIdCounter = 0;
+
+/**
+ * Assign a unique numeric ID to a WebSocket for internal tracking.
+ * Stored as a hidden property on the ws instance.
+ */
+export function getWsId(ws: WebSocket): number {
+  const key = "__sid" as string;
+  const stored = (ws as unknown as Record<string, unknown>)[key];
+  if (stored !== undefined) return stored as number;
+  (ws as unknown as Record<string, unknown>)[key] = wsIdCounter;
+  return wsIdCounter++;
+}
 
 export class WsTransport {
   private wss!: Server;
   private handler!: MessageHandler;
+  private onDisconnect?: DisconnectHandler;
   private ipCounts = new Map<string, number>();
 
-  async start(handler: MessageHandler): Promise<void> {
+  async start(
+    handler: MessageHandler,
+    onDisconnect?: DisconnectHandler,
+  ): Promise<void> {
     this.handler = handler;
+    this.onDisconnect = onDisconnect;
     this.wss = new WebSocketServer({ host: WS_HOST, port: WS_PORT });
 
     this.wss.on("connection", (ws, req) => {
+      getWsId(ws); // ensure ws has an ID on connect
       const ip = (req as Request).socket?.remoteAddress ?? "unknown";
 
       const count = this.ipCounts.get(ip) ?? 0;
@@ -52,6 +75,7 @@ export class WsTransport {
 
       ws.on("close", () => {
         this.ipCounts.set(ip, Math.max(0, count - 1));
+        this.onDisconnect?.("(unassigned)");
       });
     });
 
